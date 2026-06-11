@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import random
 import re
 import uuid
 from typing import AsyncGenerator
@@ -30,13 +31,27 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 
 jobs: dict[str, dict] = {}
 
-AMAZON_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Cache-Control": "no-cache",
-}
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+]
+
+def get_amazon_headers():
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+    }
 
 
 class JobRequest(BaseModel):
@@ -53,20 +68,25 @@ def asin_from_input(raw: str) -> str:
     raise ValueError(f"Cannot parse ASIN from: {raw}")
 
 
-async def scrape_amazon(asin: str) -> dict:
-    url = f"https://www.amazon.com/dp/{asin}"
-    async with httpx.AsyncClient(headers=AMAZON_HEADERS, follow_redirects=True, timeout=20) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        html = r.text
-
+def parse_amazon_html(asin: str, html: str) -> dict | None:
+    """Parse Amazon HTML and return product dict, or None if blocked."""
     soup = BeautifulSoup(html, "lxml")
+
+    # Detect bot block / captcha
+    if soup.select_one("form[action*='validateCaptcha']") or "Type the characters you see" in html:
+        return None
+    if "Sorry, we just need to make sure you're not a robot" in html:
+        return None
 
     # Title
     title = ""
     el = soup.select_one("#productTitle")
     if el:
         title = el.get_text(strip=True)
+
+    # If no title found, likely blocked
+    if not title:
+        return None
 
     # Price
     price = ""
@@ -83,11 +103,14 @@ async def scrape_amazon(asin: str) -> dict:
         if t:
             bullets.append(t)
 
-    # Description
+    # Description — try multiple selectors
     description = ""
-    el = soup.select_one("#productDescription p")
-    if el:
-        description = el.get_text(strip=True)
+    for sel in ["#productDescription p", "#productDescription", "#aplus .aplus-module-wrapper p"]:
+        el = soup.select_one(sel)
+        if el:
+            description = el.get_text(strip=True)
+            if description:
+                break
 
     # Images from JS data
     images = []
@@ -110,12 +133,51 @@ async def scrape_amazon(asin: str) -> dict:
 
     return {
         "asin": asin,
-        "title": title or f"Product {asin}",
+        "title": title,
         "price": price,
         "bullets": bullets[:6],
         "description": description,
         "images": images[:8],
     }
+
+
+async def scrape_amazon(asin: str) -> dict:
+    # Try multiple URL patterns with delay between retries
+    urls_to_try = [
+        f"https://www.amazon.com/dp/{asin}",
+        f"https://www.amazon.com/dp/{asin}?th=1&psc=1",
+        f"https://www.amazon.com/gp/product/{asin}",
+    ]
+
+    last_error = None
+    for attempt, url in enumerate(urls_to_try):
+        if attempt > 0:
+            await asyncio.sleep(2 + random.random() * 2)  # 2-4s delay between retries
+
+        try:
+            async with httpx.AsyncClient(
+                headers=get_amazon_headers(),
+                follow_redirects=True,
+                timeout=25,
+            ) as client:
+                r = await client.get(url)
+                if r.status_code == 503 or r.status_code == 429:
+                    last_error = f"Amazon returned {r.status_code} (rate limit)"
+                    continue
+                r.raise_for_status()
+                html = r.text
+
+            result = parse_amazon_html(asin, html)
+            if result:
+                return result
+            last_error = "Amazon blocked the request (captcha/bot detection)"
+
+        except httpx.TimeoutException:
+            last_error = "Request timed out"
+        except Exception as e:
+            last_error = str(e)
+
+    raise ValueError(f"Could not scrape ASIN {asin}: {last_error}")
 
 
 async def scrape_tiktok_keywords(category: str) -> list[str]:
@@ -266,6 +328,10 @@ async def run_pipeline(job_id: str, asins: list[str]) -> AsyncGenerator:
 
         try:
             product = await scrape_amazon(asin)
+        except ValueError as e:
+            async for evt in emit("error", {"asin": asin, "message": str(e), "hint": "Amazon is blocking the scraper. Try again in 30 seconds, or paste the full product URL."}):
+                yield evt
+            continue
         except Exception as e:
             async for evt in emit("error", {"asin": asin, "message": f"Amazon scrape failed: {str(e)}"}):
                 yield evt
