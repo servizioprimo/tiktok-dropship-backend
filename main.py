@@ -6,14 +6,13 @@ import uuid
 from typing import AsyncGenerator
 
 import httpx
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
-from playwright.async_api import async_playwright
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
-
 
 load_dotenv()
 
@@ -29,18 +28,22 @@ app.add_middleware(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# ── In-memory job store ──────────────────────────────────────────────────────
 jobs: dict[str, dict] = {}
+
+AMAZON_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+}
 
 
 class JobRequest(BaseModel):
     asins: list[str]
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
 def asin_from_input(raw: str) -> str:
-    """Extract ASIN from a URL or return as-is if already an ASIN."""
     match = re.search(r"/dp/([A-Z0-9]{10})", raw)
     if match:
         return match.group(1)
@@ -50,79 +53,64 @@ def asin_from_input(raw: str) -> str:
     raise ValueError(f"Cannot parse ASIN from: {raw}")
 
 
-async def scrape_amazon(asin: str, page) -> dict:
-    """Scrape product data and images from Amazon listing."""
+async def scrape_amazon(asin: str) -> dict:
     url = f"https://www.amazon.com/dp/{asin}"
-    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    await page.wait_for_timeout(2000)
+    async with httpx.AsyncClient(headers=AMAZON_HEADERS, follow_redirects=True, timeout=20) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        html = r.text
+
+    soup = BeautifulSoup(html, "lxml")
 
     # Title
     title = ""
-    try:
-        title = await page.locator("#productTitle").inner_text(timeout=5000)
-        title = title.strip()
-    except Exception:
-        pass
+    el = soup.select_one("#productTitle")
+    if el:
+        title = el.get_text(strip=True)
 
     # Price
     price = ""
-    for selector in ["#priceblock_ourprice", ".a-price .a-offscreen", "#price_inside_buybox"]:
-        try:
-            price = await page.locator(selector).first.inner_text(timeout=3000)
-            price = price.strip()
-            if price:
-                break
-        except Exception:
-            pass
+    for sel in ["#priceblock_ourprice", ".a-price .a-offscreen", "#price_inside_buybox", ".a-price-whole"]:
+        el = soup.select_one(sel)
+        if el:
+            price = el.get_text(strip=True)
+            break
 
-    # Bullet points
+    # Bullets
     bullets = []
-    try:
-        items = await page.locator("#feature-bullets li span.a-list-item").all()
-        for item in items:
-            text = await item.inner_text()
-            text = text.strip()
-            if text:
-                bullets.append(text)
-    except Exception:
-        pass
+    for li in soup.select("#feature-bullets li span.a-list-item"):
+        t = li.get_text(strip=True)
+        if t:
+            bullets.append(t)
 
     # Description
     description = ""
-    try:
-        description = await page.locator("#productDescription p").first.inner_text(timeout=5000)
-        description = description.strip()
-    except Exception:
-        pass
+    el = soup.select_one("#productDescription p")
+    if el:
+        description = el.get_text(strip=True)
 
-    # Images — extract from imageGalleryData or colorImages JS var
+    # Images from JS data
     images = []
-    try:
-        content = await page.content()
-        # Try to find high-res image URLs in page JS
-        matches = re.findall(r'"hiRes":"(https://[^"]+)"', content)
-        if not matches:
-            matches = re.findall(r'"large":"(https://[^"]+)"', content)
-        seen = set()
-        for m in matches:
-            if m not in seen and "images/I/" in m:
-                seen.add(m)
-                images.append(m)
-    except Exception:
-        pass
+    matches = re.findall(r'"hiRes"\s*:\s*"(https://[^"]+)"', html)
+    if not matches:
+        matches = re.findall(r'"large"\s*:\s*"(https://[^"]+)"', html)
+    seen = set()
+    for m in matches:
+        if m not in seen and "images/I/" in m:
+            seen.add(m)
+            images.append(m)
 
-    # Fallback: grab main image src
+    # Fallback main image
     if not images:
-        try:
-            src = await page.locator("#landingImage").get_attribute("src")
-            if src:
-                images.append(src)
-        except Exception:
-            pass
+        el = soup.select_one("#landingImage")
+        if el and el.get("src"):
+            images.append(el["src"])
+        elif el and el.get("data-src"):
+            images.append(el["data-src"])
 
     return {
         "asin": asin,
-        "title": title,
+        "title": title or f"Product {asin}",
         "price": price,
         "bullets": bullets[:6],
         "description": description,
@@ -131,30 +119,22 @@ async def scrape_amazon(asin: str, page) -> dict:
 
 
 async def scrape_tiktok_keywords(category: str) -> list[str]:
-    """Scrape trending keywords from TikTok Creative Center."""
+    """Fetch trending keywords from TikTok Creative Center."""
     keywords = []
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(
-                f"https://ads.tiktok.com/business/creativecenter/keyword/pc/en",
-                wait_until="domcontentloaded",
-                timeout=20000,
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            r = await client.get(
+                "https://ads.tiktok.com/business/creativecenter/keyword/pc/en",
+                headers={"User-Agent": "Mozilla/5.0"},
             )
-            await page.wait_for_timeout(3000)
-            # Try to get keyword items
-            items = await page.locator(".keyword-item, .trending-keyword, [class*='keyword']").all()
-            for item in items[:20]:
-                text = await item.inner_text()
-                text = text.strip()
-                if text and len(text) < 50:
-                    keywords.append(text)
-            await browser.close()
+            soup = BeautifulSoup(r.text, "lxml")
+            for el in soup.select("[class*='keyword']")[:20]:
+                t = el.get_text(strip=True)
+                if t and 2 < len(t) < 40:
+                    keywords.append(t)
     except Exception:
         pass
 
-    # Fallback: category-based keywords if scraping fails
     if not keywords:
         fallback = {
             "electronics": ["viral gadget", "tech deal", "must have", "life hack", "under $20", "aesthetic", "trending tech"],
@@ -165,35 +145,28 @@ async def scrape_tiktok_keywords(category: str) -> list[str]:
             "default": ["viral product", "must have", "TikTok made me buy it", "life changing", "under $30", "aesthetic"],
         }
         cat_lower = category.lower()
-        for key in fallback:
-            if key in cat_lower:
-                keywords = fallback[key]
-                break
-        if not keywords:
-            keywords = fallback["default"]
+        keywords = next((v for k, v in fallback.items() if k in cat_lower), fallback["default"])
 
     return keywords
 
 
 def detect_category(title: str) -> str:
-    """Detect product category from title."""
     title_lower = title.lower()
-    categories = {
+    cats = {
         "electronics": ["phone", "laptop", "tablet", "cable", "charger", "bluetooth", "wireless", "usb", "led", "camera", "speaker", "headphone", "earphone"],
-        "home": ["pillow", "blanket", "kitchen", "storage", "organizer", "shelf", "lamp", "curtain", "mat", "towel", "furniture"],
-        "beauty": ["serum", "moisturizer", "cream", "lipstick", "mascara", "foundation", "skincare", "hair", "nail", "perfume", "lotion"],
+        "home": ["pillow", "blanket", "kitchen", "storage", "organizer", "shelf", "lamp", "curtain", "mat", "towel"],
+        "beauty": ["serum", "moisturizer", "cream", "lipstick", "mascara", "foundation", "skincare", "hair", "nail", "perfume"],
         "clothing": ["shirt", "dress", "pants", "shoes", "jacket", "hoodie", "socks", "hat", "bag", "wallet"],
-        "fitness": ["dumbbell", "yoga", "resistance", "protein", "supplement", "gym", "workout", "exercise", "band"],
+        "fitness": ["dumbbell", "yoga", "resistance", "protein", "supplement", "gym", "workout", "exercise"],
         "toys": ["toy", "game", "puzzle", "kids", "children", "play", "lego", "doll"],
     }
-    for cat, keywords in categories.items():
+    for cat, keywords in cats.items():
         if any(kw in title_lower for kw in keywords):
             return cat
     return "general"
 
 
 def enrich_with_groq(product: dict, tiktok_keywords: list[str]) -> dict:
-    """Use Groq to rewrite listing for TikTok Shop."""
     kw_str = ", ".join(tiktok_keywords[:10])
     bullets_str = "\n".join(f"- {b}" for b in product["bullets"])
 
@@ -211,7 +184,7 @@ TRENDING TIKTOK KEYWORDS TO NATURALLY INCLUDE: {kw_str}
 RULES:
 - Title: max 60 chars, include 2-3 trending keywords naturally, benefit-focused
 - Bullets: 5 bullets, short punchy sentences, benefits over features, TikTok Gen-Z tone
-- Description: 3-4 sentences, conversational, include social proof language ("everyone's talking about"), end with soft CTA
+- Description: 3-4 sentences, conversational, include social proof language, end with soft CTA
 - Do NOT sound like Amazon. Sound like a TikTok creator recommending a product.
 
 Respond ONLY in this exact JSON format:
@@ -229,7 +202,6 @@ Respond ONLY in this exact JSON format:
     )
 
     text = response.choices[0].message.content.strip()
-    # Extract JSON
     json_match = re.search(r'\{.*\}', text, re.DOTALL)
     if json_match:
         return json.loads(json_match.group())
@@ -237,46 +209,21 @@ Respond ONLY in this exact JSON format:
 
 
 def generate_image_prompts(product: dict, images: list[str]) -> list[dict]:
-    """Generate a ChatGPT prompt for each image."""
     category = detect_category(product["title"])
     title = product["title"]
 
     style_map = {
-        "electronics": {
-            "bg": "clean white background with subtle tech-grid shadow",
-            "frame": "no frame, minimal clean edges",
-            "angle": "slight 3/4 angle showing depth and ports",
-        },
-        "home": {
-            "bg": "soft neutral lifestyle background, warm tones",
-            "frame": "thin white border with soft drop shadow",
-            "angle": "flat lay or slight elevated angle",
-        },
-        "beauty": {
-            "bg": "pastel gradient background, pink or lavender",
-            "frame": "elegant thin gold or white border",
-            "angle": "front-facing with slight tilt for elegance",
-        },
-        "clothing": {
-            "bg": "clean white or light grey background",
-            "frame": "no frame, product fills frame",
-            "angle": "front flat lay, evenly lit",
-        },
-        "fitness": {
-            "bg": "energetic dark background or gym floor texture",
-            "frame": "no frame, bold product presentation",
-            "angle": "dynamic angle showing product in use context",
-        },
-        "default": {
-            "bg": "clean white background, professional product shot",
-            "frame": "thin white border with soft shadow",
-            "angle": "front-facing, centred",
-        },
+        "electronics": {"bg": "clean white background with subtle tech-grid shadow", "frame": "no frame, minimal clean edges", "angle": "slight 3/4 angle showing depth"},
+        "home": {"bg": "soft neutral lifestyle background, warm tones", "frame": "thin white border with soft drop shadow", "angle": "flat lay or slight elevated angle"},
+        "beauty": {"bg": "pastel gradient background, pink or lavender", "frame": "elegant thin gold or white border", "angle": "front-facing with slight tilt"},
+        "clothing": {"bg": "clean white or light grey background", "frame": "no frame, product fills frame", "angle": "front flat lay, evenly lit"},
+        "fitness": {"bg": "energetic dark background or gym floor texture", "frame": "no frame, bold product presentation", "angle": "dynamic angle"},
+        "default": {"bg": "clean white background, professional product shot", "frame": "thin white border with soft shadow", "angle": "front-facing, centred"},
     }
 
     style = style_map.get(category, style_map["default"])
-
     prompts = []
+
     for i, img_url in enumerate(images):
         prompt_text = f"""Edit this product image for TikTok Shop listing.
 
@@ -286,7 +233,7 @@ INSTRUCTIONS:
 1. BACKGROUND: Replace background with {style['bg']}
 2. FRAME: {style['frame']}
 3. ANGLE/PERSPECTIVE: {style['angle']}
-4. REMOVE any barcodes, ISBNs, UPC codes, Amazon logos, or watermarks visible on the product or packaging
+4. REMOVE any barcodes, ISBNs, UPC codes, Amazon logos, or watermarks
 5. LIGHTING: Bright, even, commercial product lighting — no harsh shadows
 6. OUTPUT SIZE: 800x800px square
 7. Keep the product sharp and centred
@@ -294,102 +241,74 @@ INSTRUCTIONS:
 
 Return only the edited image file."""
 
-        prompts.append({
-            "image_index": i + 1,
-            "image_url": img_url,
-            "prompt": prompt_text,
-        })
+        prompts.append({"image_index": i + 1, "image_url": img_url, "prompt": prompt_text})
 
     return prompts
 
 
-# ── SSE Pipeline ─────────────────────────────────────────────────────────────
-
 async def run_pipeline(job_id: str, asins: list[str]) -> AsyncGenerator:
-    """Run the full pipeline and stream progress events."""
-
     async def emit(event: str, data: dict):
         jobs[job_id]["events"].append({"event": event, "data": data})
         yield {"event": event, "data": json.dumps(data)}
 
     jobs[job_id] = {"status": "running", "events": [], "products": []}
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
-
-        for idx, raw in enumerate(asins):
-            try:
-                asin = asin_from_input(raw)
-            except ValueError as e:
-                async for evt in emit("error", {"asin": raw, "message": str(e)}):
-                    yield evt
-                continue
-
-            # Step 1: Scrape Amazon
-            async for evt in emit("progress", {"asin": asin, "step": "scraping_amazon", "message": f"Scraping Amazon listing for {asin}..."}):
+    for raw in asins:
+        try:
+            asin = asin_from_input(raw)
+        except ValueError as e:
+            async for evt in emit("error", {"asin": raw, "message": str(e)}):
                 yield evt
+            continue
 
-            try:
-                product = await scrape_amazon(asin, page)
-            except Exception as e:
-                async for evt in emit("error", {"asin": asin, "message": f"Amazon scrape failed: {str(e)}"}):
-                    yield evt
-                continue
+        async for evt in emit("progress", {"asin": asin, "step": "scraping_amazon", "message": f"Scraping Amazon listing for {asin}..."}):
+            yield evt
 
-            # Step 2: TikTok keywords
-            async for evt in emit("progress", {"asin": asin, "step": "fetching_keywords", "message": "Fetching TikTok trending keywords..."}):
+        try:
+            product = await scrape_amazon(asin)
+        except Exception as e:
+            async for evt in emit("error", {"asin": asin, "message": f"Amazon scrape failed: {str(e)}"}):
                 yield evt
+            continue
 
-            category = detect_category(product["title"])
-            tiktok_keywords = await scrape_tiktok_keywords(category)
+        async for evt in emit("progress", {"asin": asin, "step": "fetching_keywords", "message": "Fetching TikTok trending keywords..."}):
+            yield evt
 
-            # Step 3: Groq enrichment
-            async for evt in emit("progress", {"asin": asin, "step": "enriching", "message": "Enriching listing with TikTok keywords via AI..."}):
+        category = detect_category(product["title"])
+        tiktok_keywords = await scrape_tiktok_keywords(category)
+
+        async for evt in emit("progress", {"asin": asin, "step": "enriching", "message": "Enriching listing with AI..."}):
+            yield evt
+
+        try:
+            enriched = enrich_with_groq(product, tiktok_keywords)
+        except Exception as e:
+            async for evt in emit("error", {"asin": asin, "message": f"Enrichment failed: {str(e)}"}):
                 yield evt
+            enriched = {"title": product["title"], "bullets": product["bullets"], "description": product["description"]}
 
-            try:
-                enriched = enrich_with_groq(product, tiktok_keywords)
-            except Exception as e:
-                async for evt in emit("error", {"asin": asin, "message": f"Enrichment failed: {str(e)}"}):
-                    yield evt
-                enriched = {
-                    "title": product["title"],
-                    "bullets": product["bullets"],
-                    "description": product["description"],
-                }
+        async for evt in emit("progress", {"asin": asin, "step": "generating_prompts", "message": "Generating ChatGPT image prompts..."}):
+            yield evt
 
-            # Step 4: Generate image prompts
-            async for evt in emit("progress", {"asin": asin, "step": "generating_prompts", "message": "Generating ChatGPT image prompts..."}):
-                yield evt
+        image_prompts = generate_image_prompts(product, product["images"])
 
-            image_prompts = generate_image_prompts(product, product["images"])
+        result = {
+            "asin": asin,
+            "original": product,
+            "enriched": enriched,
+            "tiktok_keywords": tiktok_keywords,
+            "image_prompts": image_prompts,
+            "category": category,
+        }
+        jobs[job_id]["products"].append(result)
 
-            # Final result
-            result = {
-                "asin": asin,
-                "original": product,
-                "enriched": enriched,
-                "tiktok_keywords": tiktok_keywords,
-                "image_prompts": image_prompts,
-                "category": category,
-            }
-            jobs[job_id]["products"].append(result)
-
-            async for evt in emit("product_done", {"asin": asin, "product": result}):
-                yield evt
-
-        await browser.close()
+        async for evt in emit("product_done", {"asin": asin, "product": result}):
+            yield evt
 
     jobs[job_id]["status"] = "done"
     async for evt in emit("done", {"message": "All products processed.", "total": len(asins)}):
         yield evt
 
-
-# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/jobs")
 async def create_job(req: JobRequest):
@@ -400,22 +319,8 @@ async def create_job(req: JobRequest):
     return {"job_id": job_id}
 
 
-@app.get("/api/jobs/{job_id}/stream")
-async def stream_job(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    async def generator():
-        asins = jobs[job_id].get("asins", [])
-        async for event in run_pipeline(job_id, asins):
-            yield event
-
-    return EventSourceResponse(generator())
-
-
 @app.post("/api/jobs/{job_id}/start")
 async def start_job(job_id: str, req: JobRequest):
-    """Start processing — stores ASINs and streams via SSE."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     jobs[job_id]["asins"] = req.asins
